@@ -1,6 +1,14 @@
+![Pocket Expenses banner](assets/pocket-expenses-banner.png)
+
 # Pocket Expenses
 
 Pocket Expenses is an Android household budget app for tracking expenses, income, transfers, savings, upcoming bills, financial reports, SMS transaction review, home-screen widgets, and biometric app unlock.
+
+## Screenshots
+
+| Home dashboard | Financial report | Resizable widgets |
+| --- | --- | --- |
+| <img src="assets/screenshots/home-dashboard.jpg" alt="Pocket Expenses home dashboard" width="260"> | <img src="assets/screenshots/financial-report.jpg" alt="Pocket Expenses financial report" width="260"> | <img src="assets/screenshots/home-widgets.jpg" alt="Pocket Expenses Android widgets" width="260"> |
 
 ## Download
 
@@ -9,6 +17,12 @@ Download and install the latest signed APK from the [Releases page](../../releas
 - Android package: `com.householdledger.expenses`
 - Current release: `1.5.1`
 - Android may ask you to allow installs from your browser or file manager.
+
+### Play Protect and SMS permission notice
+
+Pocket Expenses can read and receive transaction SMS messages so its optional bank-message parser can suggest expenses and income for review. Because this is a sensitive Android permission and the APK is installed outside Google Play, Google Play Protect may display a warning or block installation on some devices.
+
+Only install the APK if you trust this official repository and have verified the release details. If Android blocks the installation and you choose to continue, use the device's one-time **Install anyway** or temporary Play Protect override, then turn protection back on immediately. Do not leave Play Protect disabled. Installation and use are at your own risk, and SMS access can be denied if you do not want to use the parser.
 
 ## Set up Supabase
 
