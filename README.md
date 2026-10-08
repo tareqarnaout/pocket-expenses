@@ -15,7 +15,7 @@ Pocket Expenses is an Android household budget app for tracking expenses, income
 Download and install the latest signed APK from the [Releases page](../../releases/latest).
 
 - Android package: `com.householdledger.expenses`
-- Current release: `1.5.2`
+- Current release: `1.5.3`
 - Android may ask you to allow installs from your browser or file manager.
 
 ### Play Protect and SMS permission notice
