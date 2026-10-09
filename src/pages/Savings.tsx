@@ -1,0 +1,795 @@
+import { readSavingsPlan, saveSavingsPlan } from '../lib/savingsPlan'
+import { ExpenseWidget } from '../lib/widget'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { TrendingUp, TrendingDown, HandCoins, Coins, RefreshCw } from 'lucide-react'
+import { useIncome } from '../hooks/useIncome'
+import { useTransfers } from '../hooks/useTransfers'
+import { useExpenses } from '../hooks/useExpenses'
+import { useGoldPrice } from '../hooks/useGoldPrice'
+import { Income, Transfer, Expense } from '../types'
+import { formatCurrency, parseDateOnly, formatDate } from '../lib/utils'
+import {
+  calculateGoldFineGrams,
+  countGoldItems,
+  describeHolding,
+  formatGrams,
+  isPriceStale,
+  summarizeGoldHoldings,
+  valueOfFineGrams,
+} from '../lib/gold'
+import { useAuth } from '../context/AuthContext'
+import MonthlyBarChart from '../components/charts/MonthlyBarChart'
+import { format, subMonths, addMonths } from 'date-fns'
+
+interface MonthlySavingsData {
+  month: string
+  monthLabel: string
+  deposits: number
+  transfersIn: number
+  transfersOut: number
+  netChange: number
+}
+
+// Calculate total savings from direct deposits
+function calculateSavingsDeposits(income: Income[]): number {
+  return income
+    .filter(i => i.account_type === 'savings')
+    .reduce((sum, item) => sum + Number(item.amount), 0)
+}
+
+// Calculate net transfers to/from savings
+function calculateSavingsTransferImpact(transfers: Transfer[]): number {
+  let impact = 0
+  transfers.forEach(t => {
+    if (t.to_account === 'savings') {
+      impact += Number(t.amount)
+    }
+    if (t.from_account === 'savings') {
+      impact -= Number(t.amount)
+    }
+  })
+  return impact
+}
+
+// Group savings activity by month
+function groupSavingsByMonth(income: Income[], transfers: Transfer[]): MonthlySavingsData[] {
+  const monthMap = new Map<string, MonthlySavingsData>()
+
+  const bucketFor = (date: string): MonthlySavingsData => {
+    const parsed = parseDateOnly(date)
+    const monthKey = format(parsed, 'yyyy-MM')
+
+    if (!monthMap.has(monthKey)) {
+      monthMap.set(monthKey, {
+        month: monthKey,
+        monthLabel: format(parsed, 'MMM yyyy'),
+        deposits: 0,
+        transfersIn: 0,
+        transfersOut: 0,
+        netChange: 0,
+      })
+    }
+
+    return monthMap.get(monthKey)!
+  }
+
+  // Process savings deposits from income
+  income
+    .filter(i => i.account_type === 'savings')
+    .forEach(i => {
+      const data = bucketFor(i.date)
+      data.deposits += Number(i.amount)
+      data.netChange += Number(i.amount)
+    })
+
+  // Process transfers to/from savings. Skip transfers that don't touch savings
+  // at all -- a bank-to-cash move used to create an all-zero month here, which
+  // showed up as an empty row in the history table and a flat bar in the chart.
+  transfers
+    .filter(t => t.to_account === 'savings' || t.from_account === 'savings')
+    .forEach(t => {
+      const data = bucketFor(t.date)
+
+      if (t.to_account === 'savings') {
+        data.transfersIn += Number(t.amount)
+        data.netChange += Number(t.amount)
+      }
+      if (t.from_account === 'savings') {
+        data.transfersOut += Number(t.amount)
+        data.netChange -= Number(t.amount)
+      }
+    })
+
+  // Sort by month (most recent first)
+  return Array.from(monthMap.values()).sort((a, b) => b.month.localeCompare(a.month))
+}
+
+export default function SavingsPage({ openGoalPlanner = 0 }: { openGoalPlanner?: number }) {
+  const plannerRef = useRef<HTMLDivElement>(null)
+  const { member } = useAuth()
+
+  // Fetch all income and transfers (no date filter for total balance)
+  const { income: allIncome, loading: incomeLoading } = useIncome({})
+  const { transfers: rawTransfers, loading: transfersLoading } = useTransfers({})
+  const { expenses: allExpenses, loading: expensesLoading } = useExpenses({})
+
+  const todayKey = format(new Date(), 'yyyy-MM-dd')
+  const allTransfers = useMemo(() => rawTransfers.filter(row => row.member_id === member?.id && row.date <= todayKey), [rawTransfers, member?.id, todayKey])
+  const loading = incomeLoading || transfersLoading || expensesLoading
+
+  // These feeds include housemates' household-visible rows, but transfers are
+  // always private. Mixing the two produced a savings balance that counted a
+  // housemate's deposits without their withdrawals -- scope everything to you.
+  const myIncome = useMemo(
+    () => (member ? allIncome.filter(i => i.member_id === member.id && i.date <= todayKey) : []),
+    [allIncome, member, todayKey]
+  )
+
+  const myExpenses = useMemo(
+    () => (member ? allExpenses.filter((e: Expense) => e.member_id === member.id) : []),
+    [allExpenses, member]
+  )
+
+  const { price: goldPrice, loading: goldLoading, refreshing: goldRefreshing, refresh: refreshGold } =
+    useGoldPrice()
+
+  // Cash sitting in the savings account, separate from metal.
+  const cashSavings = useMemo(() => {
+    const deposits = calculateSavingsDeposits(myIncome)
+    const transferImpact = calculateSavingsTransferImpact(allTransfers)
+    return deposits + transferImpact
+  }, [myIncome, allTransfers])
+
+  // Gold is held as weight but reported as money: holdings come from the
+  // transfer ledger in fine grams, then get valued at today's indicative spot reference.
+  const goldFineGrams = useMemo(() => calculateGoldFineGrams(allTransfers), [allTransfers])
+  const goldItemCount = useMemo(() => countGoldItems(allTransfers), [allTransfers])
+  const goldHoldings = useMemo(() => summarizeGoldHoldings(allTransfers), [allTransfers])
+  const goldValue = useMemo(
+    () => valueOfFineGrams(goldFineGrams, goldPrice),
+    [goldFineGrams, goldPrice]
+  )
+  const holdsGold = goldFineGrams > 0.0001
+
+  const totalSavings = cashSavings + goldValue
+
+  // Calculate monthly breakdown
+  const monthlyData = useMemo(() => {
+    return groupSavingsByMonth(myIncome, allTransfers)
+  }, [myIncome, allTransfers])
+
+  // Prepare chart data for savings over time
+  const monthlyChartData = useMemo(
+    () =>
+      // Sort chronologically (oldest to newest) for the chart axis
+      [...monthlyData]
+        .sort((a, b) => a.month.localeCompare(b.month))
+        .map((m) => ({
+          name: m.monthLabel,
+          value: Number(m.netChange.toFixed(3)),
+        })),
+    [monthlyData]
+  )
+
+  // Calculate this month's savings
+  const thisMonthSavings = useMemo(() => {
+    const currentMonth = format(new Date(), 'yyyy-MM')
+    const thisMonth = monthlyData.find(m => m.month === currentMonth)
+    return thisMonth?.netChange || 0
+  }, [monthlyData])
+
+  // Calculate last month's savings for comparison
+  const lastMonthSavings = useMemo(() => {
+    const lastMonth = format(subMonths(new Date(), 1), 'yyyy-MM')
+    const data = monthlyData.find(m => m.month === lastMonth)
+    return data?.netChange || 0
+  }, [monthlyData])
+
+  // Average monthly income across history (for goal calculator context)
+  const incomeStats = useMemo(() => {
+    const monthMap = new Map<string, number>()
+
+    myIncome.forEach((i) => {
+      const monthKey = format(parseDateOnly(i.date), 'yyyy-MM')
+      monthMap.set(monthKey, (monthMap.get(monthKey) || 0) + Number(i.amount))
+    })
+
+    const months = monthMap.size
+    const total = Array.from(monthMap.values()).reduce((sum, value) => sum + value, 0)
+
+    return {
+      averageMonthlyIncome: months > 0 ? total / months : 0,
+      monthsOfHistory: months,
+    }
+  }, [myIncome])
+
+  // Average monthly expenses across history (for goal calculator context).
+  // Every expense you paid counts, shared or not. Restricting this to private
+  // expenses hid your own household spending, which inflated the "left over
+  // each month" figure and made goals look more achievable than they are.
+  const expenseStats = useMemo(() => {
+    const monthMap = new Map<string, number>()
+
+    myExpenses.forEach((e: Expense) => {
+      const monthKey = format(parseDateOnly(e.date), 'yyyy-MM')
+      monthMap.set(monthKey, (monthMap.get(monthKey) || 0) + Number(e.amount))
+    })
+
+    const months = monthMap.size
+    const total = Array.from(monthMap.values()).reduce((sum, value) => sum + value, 0)
+
+    return {
+      averageMonthlyExpenses: months > 0 ? total / months : 0,
+      monthsOfHistory: months,
+    }
+  }, [myExpenses])
+
+  // Savings goal calculator state
+  const [goalAmountInput, setGoalAmountInput] = useState(() => readSavingsPlan(member?.id).goalAmount)
+  const [monthsInput, setMonthsInput] = useState(() => readSavingsPlan(member?.id).months)
+  const [currentSavingsInput, setCurrentSavingsInput] = useState(() => readSavingsPlan(member?.id).currentSavings)
+  const [monthlyIncomeInput, setMonthlyIncomeInput] = useState(() => readSavingsPlan(member?.id).monthlyIncome)
+  const [willingMonthlyInput, setWillingMonthlyInput] = useState(() => readSavingsPlan(member?.id).willingMonthly)
+
+  const [planMemberId, setPlanMemberId] = useState(member?.id)
+  useEffect(() => {
+    if (planMemberId === member?.id) return
+    const saved = readSavingsPlan(member?.id)
+    setGoalAmountInput(saved.goalAmount)
+    setMonthsInput(saved.months)
+    setCurrentSavingsInput(saved.currentSavings)
+    setMonthlyIncomeInput(saved.monthlyIncome)
+    setWillingMonthlyInput(saved.willingMonthly)
+    setPlanMemberId(member?.id)
+  }, [member?.id, planMemberId])
+
+  useEffect(() => {
+    if (!member || planMemberId !== member.id) return
+    saveSavingsPlan(member.id, { goalAmount: goalAmountInput, months: monthsInput, currentSavings: currentSavingsInput, monthlyIncome: monthlyIncomeInput, willingMonthly: willingMonthlyInput })
+    const timer = setTimeout(() => {
+      void ExpenseWidget.updateSavingsPlan({ goalAmount: Math.max(0, Number(goalAmountInput) || 0), currentSavings: currentSavingsInput !== '' ? Math.max(0, Number(currentSavingsInput) || 0) : undefined }).catch(() => {})
+    }, 180)
+    return () => clearTimeout(timer)
+  }, [member?.id, planMemberId, goalAmountInput, monthsInput, currentSavingsInput, monthlyIncomeInput, willingMonthlyInput])
+
+  useEffect(() => {
+    if (!openGoalPlanner || loading || goldLoading) return
+    const frame = requestAnimationFrame(() => {
+      plannerRef.current?.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' })
+      plannerRef.current?.querySelector<HTMLInputElement>('input')?.focus({ preventScroll: true })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [openGoalPlanner, loading, goldLoading])
+
+  const goalAmount = parseFloat(goalAmountInput) || 0
+  const monthsToGoal = parseInt(monthsInput, 10) || 0
+  const willingMonthly = parseFloat(willingMonthlyInput) || 0
+  const effectiveCurrentSavings =
+    currentSavingsInput !== '' ? parseFloat(currentSavingsInput) || 0 : totalSavings
+
+  const remainingToGoal = Math.max(goalAmount - effectiveCurrentSavings, 0)
+  const monthlyRequired =
+    monthsToGoal > 0 ? remainingToGoal / monthsToGoal : 0
+
+  const effectiveMonthlyIncome =
+    monthlyIncomeInput !== ''
+      ? parseFloat(monthlyIncomeInput) || 0
+      : incomeStats.averageMonthlyIncome
+
+  const savingsPercentOfIncome =
+    effectiveMonthlyIncome > 0 && monthlyRequired > 0
+      ? (monthlyRequired / effectiveMonthlyIncome) * 100
+      : 0
+
+  const averageMonthlyExpenses = expenseStats.averageMonthlyExpenses
+  const discretionaryMonthly = Math.max(effectiveMonthlyIncome - averageMonthlyExpenses, 0)
+
+  const savingsPercentOfDiscretionary =
+    discretionaryMonthly > 0 && monthlyRequired > 0
+      ? (monthlyRequired / discretionaryMonthly) * 100
+      : 0
+
+  let savingsDoabilityLabel = ''
+  let savingsDoabilityColor = 'text-gray-600'
+
+  if (monthlyRequired > 0 && discretionaryMonthly > 0) {
+    if (savingsPercentOfDiscretionary <= 40) {
+      savingsDoabilityLabel = 'This goal looks very doable based on your usual spending.'
+      savingsDoabilityColor = 'text-green-600'
+    } else if (savingsPercentOfDiscretionary <= 70) {
+      savingsDoabilityLabel = 'This goal is doable but will require some discipline.'
+      savingsDoabilityColor = 'text-emerald-600'
+    } else if (savingsPercentOfDiscretionary <= 100) {
+      savingsDoabilityLabel = 'This goal is aggressive and may feel tight.'
+      savingsDoabilityColor = 'text-amber-600'
+    } else {
+      savingsDoabilityLabel = 'This goal is very aggressive vs what you usually have left after expenses.'
+      savingsDoabilityColor = 'text-red-600'
+    }
+  }
+
+  const monthsRequiredFromWilling =
+    willingMonthly > 0 && remainingToGoal > 0 ? remainingToGoal / willingMonthly : 0
+  const monthsRequiredRounded =
+    monthsRequiredFromWilling > 0 ? Math.ceil(monthsRequiredFromWilling) : 0
+  const targetDateFromWilling =
+    monthsRequiredRounded > 0 ? addMonths(new Date(), monthsRequiredRounded) : null
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Savings</h1>
+        <p className="text-gray-500 dark:text-gray-400 mt-1">
+          Track your savings progress over time
+        </p>
+      </div>
+
+      {/* Summary Cards */}
+      <div className={`grid grid-cols-1 gap-4 ${holdsGold ? 'md:grid-cols-2 xl:grid-cols-4' : 'md:grid-cols-3'}`}>
+        {/* Total Savings - Featured */}
+        <div className="bg-gradient-to-r from-purple-600 to-purple-700 rounded-xl p-5 shadow-lg text-white">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-purple-200 text-sm font-medium">Total Savings</p>
+              <p className="text-2xl font-bold mt-1">
+                {loading ? '...' : formatCurrency(totalSavings)}
+              </p>
+              {holdsGold ? (
+                <p className="text-purple-200 text-xs mt-1">
+                  {formatCurrency(cashSavings)} cash + {formatCurrency(goldValue)} gold
+                </p>
+              ) : (
+                <p className="text-purple-200 text-xs mt-1">All-time balance</p>
+              )}
+            </div>
+            <div className="p-3 bg-white/10 rounded-xl">
+              <HandCoins className="w-6 h-6" />
+            </div>
+          </div>
+        </div>
+
+        {/* Gold Holdings, valued at today's rate */}
+        {holdsGold && (
+          <div className="bg-white dark:bg-gray-800 rounded-xl p-5 shadow-sm border border-amber-200 dark:border-amber-700/60">
+            <div className="flex items-center justify-between">
+              <div className="min-w-0">
+                <p className="text-gray-500 dark:text-gray-400 text-sm font-medium">Gold</p>
+                <p className="text-xl font-bold text-amber-700 dark:text-amber-400 mt-1">
+                  {goldLoading && !goldPrice ? '...' : formatCurrency(goldValue)}
+                </p>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                  {formatGrams(goldFineGrams)} pure
+                  {goldItemCount > 0 && ` · ${goldItemCount} coin${goldItemCount === 1 ? '' : 's'}`}
+                </p>
+              </div>
+              <div className="p-3 bg-amber-50 dark:bg-amber-950/40 rounded-xl">
+                <Coins className="w-6 h-6 text-amber-600 dark:text-amber-400" />
+              </div>
+            </div>
+
+            <div className="mt-3 flex items-center justify-between gap-2 border-t border-gray-100 dark:border-gray-700 pt-2">
+              <p className="text-xs text-gray-400 dark:text-gray-500 truncate">
+                {goldPrice ? (
+                  <>
+                    {formatCurrency(Number(goldPrice.price_24k))}/g spot reference
+                    {goldPrice.source === 'spot_peg' && ' (world spot)'}
+                    {' · '}
+                    {formatDate(goldPrice.fetched_at.slice(0, 10))}
+                  </>
+                ) : (
+                  'No price recorded yet'
+                )}
+              </p>
+              <button
+                type="button"
+                onClick={() => refreshGold()}
+                disabled={goldRefreshing}
+                className="shrink-0 p-1 text-gray-400 dark:text-gray-500 hover:text-amber-600 dark:hover:text-amber-400 rounded disabled:opacity-50"
+                title="Refresh gold price"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${goldRefreshing ? 'animate-spin' : ''}`} />
+              </button>
+            </div>
+
+            {isPriceStale(goldPrice) && (
+              <p className="mt-2 text-xs text-red-600 dark:text-red-400">
+                This price is over a day old, so the value above may be off.
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* This Month */}
+        <div className="bg-white dark:bg-gray-800 rounded-xl p-5 shadow-sm border border-gray-100 dark:border-gray-700">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-gray-500 dark:text-gray-400 text-sm font-medium">This Month</p>
+              <p className={`text-xl font-bold mt-1 ${thisMonthSavings >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                {loading ? '...' : (thisMonthSavings >= 0 ? '+' : '') + formatCurrency(thisMonthSavings)}
+              </p>
+            </div>
+            <div className={`p-3 rounded-xl ${thisMonthSavings >= 0 ? 'bg-green-50 dark:bg-green-950/40' : 'bg-red-50 dark:bg-red-950/40'}`}>
+              {thisMonthSavings >= 0 ? (
+                <TrendingUp className={`w-6 h-6 text-green-600 dark:text-green-400`} />
+              ) : (
+                <TrendingDown className="w-6 h-6 text-red-600 dark:text-red-400" />
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Last Month */}
+        <div className="bg-white dark:bg-gray-800 rounded-xl p-5 shadow-sm border border-gray-100 dark:border-gray-700">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-gray-500 dark:text-gray-400 text-sm font-medium">Last Month</p>
+              <p className={`text-xl font-bold mt-1 ${lastMonthSavings >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                {loading ? '...' : (lastMonthSavings >= 0 ? '+' : '') + formatCurrency(lastMonthSavings)}
+              </p>
+            </div>
+            <div className={`p-3 rounded-xl ${lastMonthSavings >= 0 ? 'bg-green-50 dark:bg-green-950/40' : 'bg-red-50 dark:bg-red-950/40'}`}>
+              {lastMonthSavings >= 0 ? (
+                <TrendingUp className={`w-6 h-6 text-green-600 dark:text-green-400`} />
+              ) : (
+                <TrendingDown className="w-6 h-6 text-red-600 dark:text-red-400" />
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Gold holdings: what you physically own, and what it is worth today */}
+      {holdsGold && (
+        <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-100 dark:border-gray-700 overflow-hidden">
+          <div className="p-4 border-b border-gray-100 dark:border-gray-700 flex items-center justify-between gap-4">
+            <div>
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Gold Holdings</h2>
+              <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+                What you hold, and what it is worth at today&apos;s price
+              </p>
+            </div>
+            <Coins className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0" />
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-gray-50 dark:bg-gray-700/50">
+                <tr>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                    Item
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                    Count
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                    Weight
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                    Pure gold
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                    Value
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100 dark:divide-gray-700">
+                {goldHoldings.map((holding) => (
+                  <tr key={`${holding.itemType}-${holding.karat}`} className="hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors">
+                    <td className="px-4 py-3 whitespace-nowrap font-medium text-gray-900 dark:text-white">
+                      {describeHolding(holding)}
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap text-right text-gray-600 dark:text-gray-300">
+                      {holding.itemType === 'bullion' ? '—' : holding.count}
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap text-right text-gray-600 dark:text-gray-300">
+                      {formatGrams(holding.grams)}
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap text-right text-gray-600 dark:text-gray-300">
+                      {formatGrams(holding.fineGrams)}
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap text-right font-semibold text-amber-700 dark:text-amber-400">
+                      {goldPrice ? formatCurrency(valueOfFineGrams(holding.fineGrams, goldPrice)) : '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot className="bg-gray-50 dark:bg-gray-700/50 border-t border-gray-200 dark:border-gray-700">
+                <tr>
+                  <td className="px-4 py-3 font-semibold text-gray-900 dark:text-white" colSpan={3}>
+                    Total
+                  </td>
+                  <td className="px-4 py-3 text-right font-semibold text-gray-900 dark:text-white whitespace-nowrap">
+                    {formatGrams(goldFineGrams)}
+                  </td>
+                  <td className="px-4 py-3 text-right font-bold text-amber-700 dark:text-amber-400 whitespace-nowrap">
+                    {goldPrice ? formatCurrency(goldValue) : '—'}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Savings Overview Chart */}
+      <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-100 dark:border-gray-700">
+        <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Savings Over Time</h2>
+        <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+          Cash moving in and out of savings, month by month. Gold is valued at today&apos;s
+          price rather than tracked as a monthly change.
+        </p>
+        <div className="mt-4">
+          {loading ? (
+            <div className="h-[300px] flex items-center justify-center text-gray-500 dark:text-gray-400">
+              Loading savings data...
+            </div>
+          ) : (
+            <MonthlyBarChart data={monthlyChartData} />
+          )}
+        </div>
+      </div>
+
+      {/* Monthly Breakdown */}
+      <div className="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-100 dark:border-gray-700 overflow-hidden">
+        <div className="p-4 border-b border-gray-100 dark:border-gray-700">
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Monthly Cash Savings</h2>
+          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+            Deposits and transfers into your savings account each month
+          </p>
+        </div>
+        
+        {loading ? (
+          <div className="p-8 text-center text-gray-500 dark:text-gray-400">Loading savings data...</div>
+        ) : monthlyData.length === 0 ? (
+          <div className="p-8 text-center">
+            <HandCoins className="w-12 h-12 text-gray-300 dark:text-gray-600 mx-auto mb-3" />
+            <p className="text-gray-500 dark:text-gray-400">No savings activity yet</p>
+            <p className="text-sm text-gray-400 dark:text-gray-500 mt-1">
+              Add income to savings or transfer money to your savings account
+            </p>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-gray-50 dark:bg-gray-700/50">
+                <tr>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                    Month
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                    Direct Deposits
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                    Transfers In
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                    Transfers Out
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+                    Net Change
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100 dark:divide-gray-700">
+                {monthlyData.map((data) => (
+                  <tr key={data.month} className="hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors">
+                    <td className="px-4 py-4 whitespace-nowrap">
+                      <span className="font-medium text-gray-900 dark:text-white">{data.monthLabel}</span>
+                    </td>
+                    <td className="px-4 py-4 whitespace-nowrap text-right">
+                      {data.deposits > 0 ? (
+                        <span className="text-green-600 dark:text-green-400 font-medium">
+                          +{formatCurrency(data.deposits)}
+                        </span>
+                      ) : (
+                        <span className="text-gray-400 dark:text-gray-500">-</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-4 whitespace-nowrap text-right">
+                      {data.transfersIn > 0 ? (
+                        <span className="text-green-600 dark:text-green-400 font-medium">
+                          +{formatCurrency(data.transfersIn)}
+                        </span>
+                      ) : (
+                        <span className="text-gray-400 dark:text-gray-500">-</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-4 whitespace-nowrap text-right">
+                      {data.transfersOut > 0 ? (
+                        <span className="text-red-600 dark:text-red-400 font-medium">
+                          -{formatCurrency(data.transfersOut)}
+                        </span>
+                      ) : (
+                        <span className="text-gray-400 dark:text-gray-500">-</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-4 whitespace-nowrap text-right">
+                      <span className={`font-semibold ${data.netChange >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                        {data.netChange >= 0 ? '+' : ''}{formatCurrency(data.netChange)}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Savings Goal Calculator */}
+      <div ref={plannerRef} id="savings-goal-planner" style={{ scrollMarginTop: 100 }} className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-100 dark:border-gray-700">
+        <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Savings Goal Planner</h2>
+        <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+          Set a goal and see how much you need to save each month to reach it.
+        </p>
+
+        <div className="mt-4 grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Goal amount</label>
+            <input
+              type="number"
+              min="0"
+              value={goalAmountInput}
+              onChange={(e) => setGoalAmountInput(e.target.value)}
+              placeholder="e.g. 2000"
+              className="mt-1 block w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2 text-sm shadow-sm focus:border-purple-500 focus:ring-purple-500"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Months to reach goal</label>
+            <input
+              type="number"
+              min="1"
+              value={monthsInput}
+              onChange={(e) => setMonthsInput(e.target.value)}
+              placeholder="e.g. 12"
+              className="mt-1 block w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2 text-sm shadow-sm focus:border-purple-500 focus:ring-purple-500"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Current savings</label>
+            <input
+              type="number"
+              min="0"
+              value={currentSavingsInput}
+              onChange={(e) => setCurrentSavingsInput(e.target.value)}
+              placeholder={loading ? 'Detecting current savings...' : String(totalSavings.toFixed(3))}
+              className="mt-1 block w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2 text-sm shadow-sm focus:border-purple-500 focus:ring-purple-500"
+            />
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              Leave blank to use your total savings balance.
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Monthly income</label>
+            <input
+              type="number"
+              min="0"
+              value={monthlyIncomeInput}
+              onChange={(e) => setMonthlyIncomeInput(e.target.value)}
+              placeholder={
+                incomeStats.averageMonthlyIncome > 0
+                  ? String(incomeStats.averageMonthlyIncome.toFixed(3))
+                  : 'e.g. 1000'
+              }
+              className="mt-1 block w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2 text-sm shadow-sm focus:border-purple-500 focus:ring-purple-500"
+            />
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              Leave blank to use your average monthly income.
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Monthly amount you can save</label>
+            <input
+              type="number"
+              min="0"
+              value={willingMonthlyInput}
+              onChange={(e) => setWillingMonthlyInput(e.target.value)}
+              placeholder="e.g. 150"
+              className="mt-1 block w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white px-3 py-2 text-sm shadow-sm focus:border-purple-500 focus:ring-purple-500"
+            />
+            <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              Optional: enter what you&apos;re comfortable saving each month to see how long it would take.
+            </p>
+          </div>
+        </div>
+
+        {goalAmount > 0 && (monthsToGoal > 0 || (willingMonthly > 0 && remainingToGoal > 0)) && (
+          <div className="mt-6 border-t border-gray-100 dark:border-gray-700 pt-4">
+            {remainingToGoal <= 0 ? (
+              <p className="text-sm font-medium text-green-600 dark:text-green-400">
+                You have already reached this goal.
+              </p>
+            ) : (
+              <>
+                {monthsToGoal > 0 && (
+                  <>
+                    <p className="text-sm text-gray-700 dark:text-gray-300">
+                      To reach a goal of <span className="font-semibold">{formatCurrency(goalAmount)}</span> in{' '}
+                      <span className="font-semibold">{monthsToGoal}</span> months, starting from{' '}
+                      <span className="font-semibold">{formatCurrency(effectiveCurrentSavings)}</span>, you need to
+                      save approximately:
+                    </p>
+                    <p className="mt-2 text-2xl font-bold text-purple-600 dark:text-purple-400">
+                      {formatCurrency(monthlyRequired)} <span className="text-base font-medium text-gray-500 dark:text-gray-400">per month</span>
+                    </p>
+
+                    {effectiveMonthlyIncome > 0 && (
+                      <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
+                        Based on a monthly income of{' '}
+                        <span className="font-medium text-gray-900 dark:text-white">{formatCurrency(effectiveMonthlyIncome)}</span>
+                        {incomeStats.monthsOfHistory > 0 && monthlyIncomeInput === '' && (
+                          <>
+                            {' '} (average over {incomeStats.monthsOfHistory} month
+                            {incomeStats.monthsOfHistory === 1 ? '' : 's'})
+                          </>
+                        )}
+                        , this is about{' '}
+                        <span className="font-medium text-gray-900 dark:text-white">{savingsPercentOfIncome.toFixed(1)}%</span> of your income.
+                      </p>
+                    )}
+
+                    {expenseStats.monthsOfHistory > 0 && (
+                      <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
+                        Your average monthly expenses are{' '}
+                        <span className="font-medium text-gray-900 dark:text-white">{formatCurrency(averageMonthlyExpenses)}</span>
+                        {' '} (based on {expenseStats.monthsOfHistory} month
+                        {expenseStats.monthsOfHistory === 1 ? '' : 's'}). That typically leaves about{' '}
+                        <span className="font-medium text-gray-900 dark:text-white">{formatCurrency(discretionaryMonthly)}</span> per month after expenses.
+                      </p>
+                    )}
+
+                    {savingsDoabilityLabel && (
+                      <p className={`mt-3 text-sm font-medium ${savingsDoabilityColor}`}>
+                        {savingsDoabilityLabel}{' '}
+                        {discretionaryMonthly > 0 && monthlyRequired > 0 && (
+                          <>
+                            You're aiming to save about{' '}
+                            <span className="font-semibold">
+                              {savingsPercentOfDiscretionary.toFixed(1)}%
+                            </span>{' '}
+                            of what you usually have left after expenses.
+                          </>
+                        )}
+                      </p>
+                    )}
+                  </>
+                )}
+
+                {willingMonthly > 0 && remainingToGoal > 0 && (
+                  <>
+                    <p className="mt-4 text-sm text-gray-700 dark:text-gray-300">
+                      If you save <span className="font-semibold">{formatCurrency(willingMonthly)}</span> per month toward
+                      this goal, starting from{' '}
+                      <span className="font-semibold">{formatCurrency(effectiveCurrentSavings)}</span>, it will take
+                      approximately{' '}
+                      <span className="font-semibold">{monthsRequiredFromWilling.toFixed(1)}</span> months
+                      {monthsRequiredRounded > 0 && targetDateFromWilling && (
+                        <>
+                          {' '} (about{' '}
+                          <span className="font-semibold">
+                            {monthsRequiredRounded} month{monthsRequiredRounded === 1 ? '' : 's'}
+                          </span>
+                          , around{' '}
+                          <span className="font-semibold">
+                            {format(targetDateFromWilling, 'MMM yyyy')}
+                          </span>
+                          ).
+                        </>
+                      )}
+                      .
+                    </p>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}

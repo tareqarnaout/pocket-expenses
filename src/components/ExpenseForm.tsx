@@ -1,0 +1,181 @@
+import { useState, useEffect } from 'react'
+import { format } from 'date-fns'
+import { Category, ExpenseFormData, Expense, AccountType, Visibility } from '../types'
+
+interface ExpenseFormProps {
+  categories: Category[]
+  onSubmit: (data: ExpenseFormData) => Promise<void>
+  onCancel: () => void
+  initialData?: Expense
+}
+
+export default function ExpenseForm({
+  categories,
+  onSubmit,
+  onCancel,
+  initialData,
+}: ExpenseFormProps) {
+  const [formData, setFormData] = useState<ExpenseFormData>({
+    amount: initialData?.amount || 0,
+    description: initialData?.description || '',
+    category_id: initialData?.category_id || '',
+    date: initialData?.date || format(new Date(), 'yyyy-MM-dd'),
+    visibility: initialData?.visibility || 'private',
+    member_id: initialData?.member_id || '',
+    account_type: initialData?.account_type || 'bank',
+  })
+  const [loading, setLoading] = useState(false)
+
+  // Filter categories to only show expense-related ones
+  const expenseCategories = categories.filter(
+    (c) => c.category_type === 'expense' || c.category_type === 'both'
+  )
+
+  useEffect(() => {
+    // Reset form when initialData changes (both for edit mode and new expense mode)
+    setFormData({
+      amount: initialData?.amount || 0,
+      description: initialData?.description || '',
+      category_id: initialData?.category_id || '',
+      date: initialData?.date || format(new Date(), 'yyyy-MM-dd'),
+      visibility: initialData?.visibility || 'private',
+      member_id: initialData?.member_id || '',
+      account_type: initialData?.account_type || 'bank',
+    })
+  }, [initialData])
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (formData.amount <= 0) return
+
+    setLoading(true)
+    try {
+      await onSubmit(formData)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-4">
+      <div>
+        <label htmlFor="amount" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+          Amount *
+        </label>
+        <div className="relative">
+          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 dark:text-gray-400 text-sm">JOD</span>
+          <input
+            type="number"
+            inputMode="decimal"
+            id="amount"
+            step="0.001"
+            min="0.001"
+            required
+            value={formData.amount || ''}
+            onChange={(e) => setFormData({ ...formData, amount: parseFloat(e.target.value) || 0 })}
+            className="w-full pl-12 pr-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+            placeholder="0.000"
+          />
+        </div>
+      </div>
+
+      <div>
+        <label htmlFor="visibility" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+          Visibility
+        </label>
+        <select
+          id="visibility"
+          value={formData.visibility}
+          onChange={(e) => setFormData({ ...formData, visibility: e.target.value as Visibility })}
+          className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+        >
+          <option value="private">Personal</option>
+          <option value="household">Household (shared)</option>
+        </select>
+      </div>
+
+      <div>
+        <label htmlFor="account_type" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+          Account
+        </label>
+        <select
+          id="account_type"
+          value={formData.account_type}
+          onChange={(e) => setFormData({ ...formData, account_type: e.target.value as AccountType })}
+          className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+        >
+          <option value="bank">Bank Account</option>
+          <option value="cash">Cash</option>
+        </select>
+      </div>
+
+      <div>
+        <label htmlFor="category" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+          Category
+        </label>
+        <select
+          id="category"
+          value={formData.category_id}
+          onChange={(e) => setFormData({ ...formData, category_id: e.target.value })}
+          className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+        >
+          <option value="">Select a category</option>
+          {expenseCategories.map((category) => (
+            <option key={category.id} value={category.id}>
+              {category.name}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div>
+        <label htmlFor="date" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+          Date *
+        </label>
+        <input
+          type="date"
+          id="date"
+          required
+          value={formData.date}
+          onChange={(e) => setFormData({ ...formData, date: e.target.value })}
+          className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+        />
+      </div>
+
+      <div>
+        <label htmlFor="description" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+          Description
+        </label>
+        <textarea
+          id="description"
+          rows={3}
+          value={formData.description}
+          onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+          className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 resize-none"
+          placeholder="What was this expense for?"
+        />
+      </div>
+
+      <p className="text-sm text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800/80 p-2.5 rounded-lg">
+        This expense will be deducted from your {formData.account_type === 'bank' ? 'bank account' : 'cash'} balance.
+      </p>
+
+      <div className="flex gap-3 pt-4">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+        >
+          Cancel
+        </button>
+        <button
+          type="submit"
+          disabled={loading || formData.amount <= 0}
+          className="flex-1 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {loading ? 'Saving...' : initialData ? 'Update' : 'Add Expense'}
+        </button>
+      </div>
+    </form>
+  )
+}
